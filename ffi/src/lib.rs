@@ -51,6 +51,7 @@ mod alloc_stats;
 
 pub mod column_default;
 pub mod commit_range;
+pub mod concurrent_identity_column;
 mod domain_metadata;
 pub use domain_metadata::get_domain_metadata;
 pub mod engine_data;
