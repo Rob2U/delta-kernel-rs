@@ -244,6 +244,10 @@ pub struct Transaction<S = ExistingTable> {
     // handling. Whether the connector acknowledged responsibility for applying column
     // defaults.
     column_defaults_acknowledged: bool,
+    // Whether the connector acknowledged responsibility for filling Concurrent Identity Column
+    // values before writing data files.
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
+    concurrent_identity_columns_acknowledged: bool,
     // Whether the connector acknowledged responsibility for preserving Row IDs and Row Commit
     // Versions.
     #[cfg(feature = "row-tracking-preservation-in-dev")]
@@ -870,6 +874,39 @@ impl<S> Transaction<S> {
         Ok(())
     }
 
+    /// Rejects write-state creation when the table has Concurrent Identity Columns and the
+    /// connector has not acknowledged filling them.
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
+    fn ensure_concurrent_identity_columns_acknowledged(&self) -> DeltaResult<()> {
+        let has_concurrent_identity_column =
+            !crate::schema::try_collect_concurrent_identity_columns(
+                self.effective_table_config.logical_schema_ref(),
+            )?
+            .is_empty();
+        if !has_concurrent_identity_column {
+            return Ok(());
+        }
+        // A CIC column may only exist on a table that enabled the feature.
+        require!(
+            self.effective_table_config
+                .is_feature_enabled(&TableFeature::ConcurrentIdentityColumns),
+            Error::invalid_transaction_state(
+                "Table contains Concurrent Identity Columns but the concurrentIdentityColumns \
+                 feature is not enabled."
+            )
+        );
+        // The connector generates and fills CIC values itself, so it must acknowledge
+        // responsibility before kernel produces write state.
+        require!(
+            self.concurrent_identity_columns_acknowledged,
+            Error::invalid_transaction_state(
+                "Writing data to a table with Concurrent Identity Columns requires calling \
+                 Transaction::ack_concurrent_identity_columns() first.",
+            )
+        );
+        Ok(())
+    }
+
     #[cfg(feature = "row-tracking-preservation-in-dev")]
     fn ensure_row_tracking_preservation_acknowledged(&self) -> DeltaResult<()> {
         if !self
@@ -998,6 +1035,19 @@ impl<S: SupportsDataFiles> Transaction<S> {
         self.column_defaults_acknowledged = true;
     }
 
+    /// Acknowledges that the connector generates and fills Concurrent Identity Column values
+    /// before writing data files.
+    ///
+    /// Call this before requesting write state for a table that has any CIC column (discover them
+    /// via [`concurrent_identity_columns`](Self::concurrent_identity_columns)). The connector
+    /// reserves ranges from its sequence service and fills every identity column itself. This
+    /// method records that responsibility but generates no values. Without this acknowledgement,
+    /// write-state creation fails.
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
+    pub fn ack_concurrent_identity_columns(&mut self) {
+        self.concurrent_identity_columns_acknowledged = true;
+    }
+
     /// Returns the expected schema for file statistics.
     ///
     /// The schema structure is derived from table configuration:
@@ -1093,6 +1143,27 @@ impl<S: SupportsDataFiles> Transaction<S> {
         Ok(defaults)
     }
 
+    /// Returns the list of Concurrent Identity Columns (CICs) in this table's logical schema.
+    ///
+    /// A CIC column's values are issued by a catalog-hosted sequence, not stored in the Delta log,
+    /// so the connector must fill them and then call
+    /// [`ack_concurrent_identity_columns`](Self::ack_concurrent_identity_columns) before requesting
+    /// write state. See [`ConcurrentIdentityColumn`](crate::schema::ConcurrentIdentityColumn) for
+    /// the full connector write-flow.
+    ///
+    /// # Errors
+    ///
+    /// Propagates malformed CIC metadata errors (a detected column missing a required
+    /// `delta.identity.*` key or carrying a malformed value).
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
+    pub fn concurrent_identity_columns(
+        &self,
+    ) -> DeltaResult<Vec<crate::schema::ConcurrentIdentityColumn<'_>>> {
+        crate::schema::try_collect_concurrent_identity_columns(
+            self.effective_table_config.logical_schema_ref(),
+        )
+    }
+
     /// Validates that the table's logical schema supports data writes.
     ///
     /// Called by [`write_state`](Self::write_state), before any Parquet is written, so connectors
@@ -1118,10 +1189,12 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// configuration.
     ///
     /// Returns an error if the table has an empty or unsupported schema, or if the table declares
-    /// column defaults that the connector has not acknowledged.
+    /// column defaults or Concurrent Identity Columns that the connector has not acknowledged.
     pub fn write_state(&self) -> DeltaResult<Arc<WriteState>> {
         self.ensure_schema_non_empty_for_write_state()?;
         self.ensure_column_defaults_acknowledged()?;
+        #[cfg(feature = "concurrent-identity-columns-in-dev")]
+        self.ensure_concurrent_identity_columns_acknowledged()?;
         self.validate_for_data_write()?;
         // The effective table configuration can change while building a transaction, so this
         // state must be derived on demand rather than cached on the transaction. TODO(#3149):

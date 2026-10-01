@@ -30,6 +30,14 @@ use crate::{DeltaResult, Error};
 pub(crate) mod column_default;
 pub use column_default::ColumnDefault;
 pub(crate) use column_default::{try_collect_column_defaults, validate_column_defaults_metadata};
+pub(crate) mod concurrent_identity_column;
+#[cfg(feature = "concurrent-identity-columns-in-dev")]
+pub(crate) use concurrent_identity_column::try_collect_concurrent_identity_columns;
+#[cfg(feature = "concurrent-identity-columns-in-dev")]
+pub use concurrent_identity_column::{concurrent_identity_column, ConcurrentIdentityColumn};
+pub(crate) use concurrent_identity_column::{
+    has_high_water_mark, validate_concurrent_identity_columns,
+};
 pub(crate) mod compare;
 #[cfg(feature = "schema-diff")]
 pub(crate) mod diff;
@@ -280,6 +288,7 @@ pub enum ColumnMetadataKey {
     IdentityStep,
     IdentityHighWaterMark,
     IdentityAllowExplicitInsert,
+    IdentityConcurrentSequenceId,
     InternalColumn,
     Invariants,
     MetadataSpec,
@@ -307,6 +316,7 @@ impl AsRef<str> for ColumnMetadataKey {
             Self::IdentityHighWaterMark => "delta.identity.highWaterMark",
             Self::IdentityStart => "delta.identity.start",
             Self::IdentityStep => "delta.identity.step",
+            Self::IdentityConcurrentSequenceId => "delta.identity.concurrent.sequenceId",
             Self::InternalColumn => "delta.isInternalColumn",
             Self::Invariants => "delta.invariants",
             Self::MetadataSpec => "delta.metadataSpec",
