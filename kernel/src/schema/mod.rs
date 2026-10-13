@@ -32,13 +32,14 @@ pub use column_default::ColumnDefault;
 pub(crate) use column_default::{try_collect_column_defaults, validate_column_defaults_metadata};
 pub(crate) mod concurrent_identity_column;
 #[cfg(feature = "concurrent-identity-columns-in-dev")]
-pub(crate) use concurrent_identity_column::has_concurrent_sequence_id;
-#[cfg(feature = "concurrent-identity-columns-in-dev")]
-pub(crate) use concurrent_identity_column::try_collect_concurrent_identity_columns;
-#[cfg(feature = "concurrent-identity-columns-in-dev")]
 pub use concurrent_identity_column::{concurrent_identity_column, ConcurrentIdentityColumn};
+#[cfg(feature = "concurrent-identity-columns-in-dev")]
 pub(crate) use concurrent_identity_column::{
-    has_high_water_mark, validate_concurrent_identity_columns,
+    has_concurrent_sequence_id, try_collect_concurrent_identity_columns,
+};
+pub(crate) use concurrent_identity_column::{
+    schema_has_concurrent_sequence_id, validate_concurrent_identity_column_evolution,
+    validate_concurrent_identity_columns,
 };
 pub(crate) mod compare;
 #[cfg(feature = "schema-diff")]

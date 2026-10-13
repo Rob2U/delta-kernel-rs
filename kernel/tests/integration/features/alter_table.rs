@@ -39,8 +39,9 @@ fn committer() -> Box<FileSystemCommitter> {
     Box::new(FileSystemCommitter::new())
 }
 
-/// A nullable `LONG` column carrying full Concurrent Identity Column metadata. A CIC must be
-/// non-nullable, and ALTER can only add nullable columns, so ALTER can never add a valid one.
+/// A nullable `LONG` column carrying full Concurrent Identity Column metadata. Built by hand
+/// because `concurrent_identity_column` only builds the valid, non-nullable form and is unavailable
+/// without the `concurrent-identity-columns-in-dev` feature.
 fn nullable_concurrent_identity_column(name: &str, sequence_id: &str) -> StructField {
     StructField::nullable(name, DataType::LONG).with_metadata([
         (
@@ -345,6 +346,7 @@ async fn add_complex_type_column(
 #[case::non_nullable(&[], StructField::not_null("age", DataType::INTEGER), "non-nullable")]
 #[case::concurrent_identity_column(
     &[],
+    // A CIC must be non-nullable, but the new sequence id is rejected first.
     nullable_concurrent_identity_column("new_id", "seq-1"),
     "cannot add Concurrent Identity Column"
 )]
@@ -724,37 +726,93 @@ async fn set_nullable_on_layout_column_with_checkpoint(
     Ok(())
 }
 
+/// Creates a catalog-managed table whose `id` column is a Concurrent Identity Column and returns
+/// its snapshot.
+#[cfg(feature = "concurrent-identity-columns-in-dev")]
+fn create_concurrent_identity_column_table(
+    table_path: &str,
+    engine: &dyn delta_kernel::Engine,
+    properties: &[(&str, &str)],
+) -> DeltaResult<Arc<Snapshot>> {
+    let schema = Arc::new(StructType::try_new([
+        concurrent_identity_column("id", "seq-abc", 1, 1, false),
+        StructField::nullable("v", DataType::STRING),
+    ])?);
+    create_table(table_path, schema, "Test/1.0")
+        .with_table_properties(
+            [
+                ("delta.feature.catalogManaged", "supported"),
+                ("io.unitycatalog.tableId", "cic-test"),
+            ]
+            .into_iter()
+            .chain(properties.iter().copied()),
+        )
+        .build(engine, Box::new(TestCatalogCommitter))?
+        .commit(engine)?
+        .unwrap_committed();
+    Snapshot::builder_for(table_path)
+        .with_max_catalog_version(0)
+        .build(engine)
+}
+
+/// A nullable classic identity column: identity keys but no `sequenceId`.
+#[cfg(feature = "concurrent-identity-columns-in-dev")]
+fn nullable_classic_identity_column(name: &str) -> StructField {
+    StructField::nullable(name, DataType::LONG).with_metadata([
+        (
+            ColumnMetadataKey::IdentityStart.as_ref(),
+            MetadataValue::Number(1),
+        ),
+        (
+            ColumnMetadataKey::IdentityStep.as_ref(),
+            MetadataValue::Number(1),
+        ),
+        (
+            ColumnMetadataKey::IdentityAllowExplicitInsert.as_ref(),
+            MetadataValue::Boolean(false),
+        ),
+    ])
+}
+
+#[cfg(feature = "concurrent-identity-columns-in-dev")]
+enum ConcurrentIdentityColumnAlter {
+    SetNullable,
+    AddConcurrent,
+    AddClassic,
+}
+
 #[cfg(feature = "concurrent-identity-columns-in-dev")]
 #[rstest]
-#[case::set_nullable_on_concurrent_identity_column(true, "must be non-nullable")]
-#[case::add_concurrent_identity_column(false, "cannot add Concurrent Identity Column")]
+#[case::set_nullable_on_concurrent_identity_column(
+    ConcurrentIdentityColumnAlter::SetNullable,
+    "must be non-nullable"
+)]
+#[case::add_concurrent_identity_column(
+    ConcurrentIdentityColumnAlter::AddConcurrent,
+    "cannot add Concurrent Identity Column"
+)]
+#[case::add_classic_identity_column(
+    ConcurrentIdentityColumnAlter::AddClassic,
+    "must be concurrent"
+)]
 #[tokio::test]
 async fn alter_on_concurrent_identity_column_table_fails(
-    #[case] set_nullable: bool,
+    #[case] op: ConcurrentIdentityColumnAlter,
     #[case] error_contains: &str,
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let engine = engine.as_ref();
-    let schema = Arc::new(StructType::try_new([concurrent_identity_column(
-        "id", "seq-abc", 1, 1, false,
-    )])?);
-    create_table(&table_path, schema, "Test/1.0")
-        .with_table_properties([
-            ("delta.feature.catalogManaged", "supported"),
-            ("io.unitycatalog.tableId", "cic-test"),
-        ])
-        .build(engine, Box::new(TestCatalogCommitter))?
-        .commit(engine)?
-        .unwrap_committed();
-    let snapshot = Snapshot::builder_for(&table_path)
-        .with_max_catalog_version(0)
-        .build(engine)?;
+    let snapshot = create_concurrent_identity_column_table(&table_path, engine, &[])?;
 
     let alter = snapshot.alter_table();
-    let alter = if set_nullable {
-        alter.set_nullable(column_name!("id"))
-    } else {
-        alter.add_column(nullable_concurrent_identity_column("new_id", "seq-new"))
+    let alter = match op {
+        ConcurrentIdentityColumnAlter::SetNullable => alter.set_nullable(column_name!("id")),
+        ConcurrentIdentityColumnAlter::AddConcurrent => {
+            alter.add_column(nullable_concurrent_identity_column("new_id", "seq-new"))
+        }
+        ConcurrentIdentityColumnAlter::AddClassic => {
+            alter.add_column(nullable_classic_identity_column("legacy_id"))
+        }
     };
     let err = alter
         .build(engine, Box::new(TestCatalogCommitter))

@@ -45,7 +45,7 @@ use crate::table_properties::{
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
 use crate::transaction::Transaction;
-use crate::utils::{current_time_ms, try_parse_uri};
+use crate::utils::{current_time_ms, require, try_parse_uri};
 use crate::{DeltaResult, Engine, Error, StorageHandler};
 
 /// Table features allowed to be enabled via `delta.feature.*=supported` during CREATE TABLE.
@@ -413,59 +413,37 @@ fn maybe_enable_invariants(schema: &SchemaRef, validated: &mut ValidatedTablePro
     }
 }
 
-/// Validates Concurrent Identity Columns (CIC) in the schema and, if any are present, enables the
-/// feature via `enable_concurrent_identity_columns` (which rejects CIC when this build lacks the
-/// `concurrent-identity-columns-in-dev` feature).
+/// Enables `concurrentIdentityColumns` (plus `identityColumns`, since a concurrent identity column
+/// is still an identity column) when the schema carries any `sequenceId`, at any depth.
+///
+/// Only detects: the CIC rules and the feature's requirements (e.g. `catalogManaged`) are checked
+/// by [`TableConfiguration::validate_concurrent_identity_columns`] on the configuration being
+/// committed. Rejects CIC when this build lacks the `concurrent-identity-columns-in-dev` feature.
 fn maybe_enable_concurrent_identity_columns(
     schema: &SchemaRef,
-    partition_columns: &[String],
     validated: &mut ValidatedTableProperties,
 ) -> DeltaResult<()> {
-    if !crate::schema::validate_concurrent_identity_columns(schema, partition_columns)? {
+    if !crate::schema::schema_has_concurrent_sequence_id(schema) {
         return Ok(());
     }
-    enable_concurrent_identity_columns(validated)
-}
-
-/// Adds the `concurrentIdentityColumns` writer feature (plus `identityColumns`, since a concurrent
-/// identity column is still an identity column) after CIC columns have been validated. Requires the
-/// `catalogManaged` feature to already be enabled.
-#[cfg(feature = "concurrent-identity-columns-in-dev")]
-fn enable_concurrent_identity_columns(validated: &mut ValidatedTableProperties) -> DeltaResult<()> {
-    // Require the caller to have enabled the `catalogManaged` feature.
-    if !validated
-        .writer_features
-        .contains(&TableFeature::CatalogManaged)
-    {
-        return Err(Error::unsupported(
-            "Concurrent Identity Columns require a catalog-managed table: enable the \
-             'catalogManaged' feature.",
-        ));
-    }
-    // Kernel supports writing an `identityColumns` table only when it is also concurrent.
-    add_feature_to_lists(
+    require!(
+        cfg!(feature = "concurrent-identity-columns-in-dev"),
+        Error::unsupported(
+            "Concurrent Identity Columns are not supported: this build was compiled without the \
+             'concurrent-identity-columns-in-dev' feature",
+        )
+    );
+    for feature in [
         TableFeature::IdentityColumns,
-        &mut validated.reader_features,
-        &mut validated.writer_features,
-    );
-    add_feature_to_lists(
         TableFeature::ConcurrentIdentityColumns,
-        &mut validated.reader_features,
-        &mut validated.writer_features,
-    );
+    ] {
+        add_feature_to_lists(
+            feature,
+            &mut validated.reader_features,
+            &mut validated.writer_features,
+        );
+    }
     Ok(())
-}
-
-/// Rejects Concurrent Identity Columns at create time when this build lacks the
-/// `concurrent-identity-columns-in-dev` feature.
-#[cfg(not(feature = "concurrent-identity-columns-in-dev"))]
-fn enable_concurrent_identity_columns(
-    _validated: &mut ValidatedTableProperties,
-) -> DeltaResult<()> {
-    Err(Error::unsupported(
-        "Concurrent Identity Columns are not supported: this build was compiled without the \
-         'concurrent-identity-columns-in-dev' feature",
-    ))
 }
 
 /// Auto-enables allowed property-driven features from the table properties (see
@@ -985,34 +963,18 @@ impl CreateTableTransactionBuilder {
 
         // Validate data layout and resolve column names (physical for clustering, logical
         // for partitioning). Adds required table features for clustering.
-        let mut data_layout_result = apply_data_layout(
+        let data_layout_result = apply_data_layout(
             &self.data_layout,
             &effective_schema,
             column_mapping_mode,
             &mut validated,
         )?;
 
-        // Partition columns are validated to be top-level, so each ColumnName has exactly one
-        // path component.
-        let partition_columns: Vec<String> = data_layout_result
-            .partition_columns
-            .take()
-            .map(|cols| {
-                cols.into_iter()
-                    .map(|c: ColumnName| c.into_inner().remove(0))
-                    .collect()
-            })
-            .unwrap_or_default();
-
         // Schema-driven auto-enablement: detect types or annotations that require a feature
         maybe_enable_variant_type(&effective_schema, &mut validated);
         maybe_enable_timestamp_ntz(&effective_schema, &mut validated);
         maybe_enable_invariants(&effective_schema, &mut validated);
-        maybe_enable_concurrent_identity_columns(
-            &effective_schema,
-            &partition_columns,
-            &mut validated,
-        )?;
+        maybe_enable_concurrent_identity_columns(&effective_schema, &mut validated)?;
 
         // Property-driven auto-enablement: check enablement properties
         maybe_auto_enable_property_driven_features(&mut validated);
@@ -1030,8 +992,14 @@ impl CreateTableTransactionBuilder {
         let protocol =
             Protocol::try_new_modern(validated.reader_features, validated.writer_features)?;
 
-        // Create Metadata action with filtered properties (feature signals removed).
-        // Use effective_schema which includes column mapping annotations if enabled.
+        // Create Metadata action with filtered properties (feature signals removed)
+        // Use effective_schema which includes column mapping annotations if enabled
+        // Partition columns are validated to be top-level, so each ColumnName has
+        // exactly one path component.
+        let partition_columns: Vec<String> = data_layout_result
+            .partition_columns
+            .map(|cols| cols.into_iter().map(|c| c.into_inner().remove(0)).collect())
+            .unwrap_or_default();
         let metadata = Metadata::try_new(
             None, // name
             None, // description
@@ -1043,6 +1011,7 @@ impl CreateTableTransactionBuilder {
 
         // Build TableConfiguration directly for the new table
         let table_configuration = TableConfiguration::try_new(metadata, protocol, table_url, 0)?;
+        table_configuration.validate_concurrent_identity_columns()?;
 
         // Create Transaction<CreateTable> with the effective table configuration
         Transaction::try_new_create_table(
@@ -1067,8 +1036,6 @@ mod tests {
     use crate::scan::data_skipping::stats_schema::StripFieldMetadataTransform;
     #[cfg(feature = "concurrent-identity-columns-in-dev")]
     use crate::schema::concurrent_identity_column::concurrent_identity_column;
-    #[cfg(feature = "concurrent-identity-columns-in-dev")]
-    use crate::schema::StructType;
     use crate::schema::{
         schema, schema_ref, try_schema, ColumnMetadataKey, DataType, MetadataValue, StructField,
     };
@@ -1646,49 +1613,51 @@ mod tests {
         ]))
     }
 
-    // `seed_features` seeds both reader and writer feature lists (CIC requires the reader+writer
-    // `catalogManaged` feature to be enabled first).
+    // Enablement only detects `sequenceId`s; the CIC rules and the `catalogManaged` requirement
+    // are checked on the built configuration (see the `create_table` tests in `transaction`).
     #[cfg(feature = "concurrent-identity-columns-in-dev")]
     #[rstest::rstest]
-    #[case::auto_enabled_with_catalog_managed(cic_schema(), vec![TableFeature::CatalogManaged], Ok(true))]
-    #[case::rejected_without_catalog_managed(cic_schema(), vec![], Err("catalog-managed"))]
-    #[case::no_cic_column(test_schema(), vec![], Ok(false))]
+    #[case::auto_enabled(cic_schema(), true)]
+    #[case::no_cic_column(test_schema(), false)]
     fn maybe_enable_concurrent_identity_columns_cases(
         #[case] schema: SchemaRef,
-        #[case] seed_features: Vec<TableFeature>,
-        #[case] expected: Result<bool, &str>,
+        #[case] enabled: bool,
     ) {
         let mut validated = ValidatedTableProperties {
             properties: HashMap::new(),
-            reader_features: seed_features.clone(),
-            writer_features: seed_features,
+            reader_features: vec![],
+            writer_features: vec![],
         };
-        let result = maybe_enable_concurrent_identity_columns(&schema, &[], &mut validated);
-        let has_cic = validated
-            .writer_features
-            .contains(&TableFeature::ConcurrentIdentityColumns);
-        match expected {
-            Ok(enabled) => {
-                result.unwrap();
-                assert_eq!(has_cic, enabled);
-                if enabled {
-                    assert!(validated
-                        .writer_features
-                        .contains(&TableFeature::IdentityColumns));
-                    assert!(!validated
-                        .reader_features
-                        .contains(&TableFeature::ConcurrentIdentityColumns));
-                    assert!(!validated
-                        .reader_features
-                        .contains(&TableFeature::IdentityColumns));
-                }
-            }
-            Err(expected_error_substring) => {
-                let err = result.unwrap_err().to_string();
-                assert!(err.contains(expected_error_substring), "unexpected: {err}");
-                assert!(!has_cic);
-            }
+        maybe_enable_concurrent_identity_columns(&schema, &mut validated).unwrap();
+        for feature in [
+            TableFeature::IdentityColumns,
+            TableFeature::ConcurrentIdentityColumns,
+        ] {
+            assert_eq!(validated.writer_features.contains(&feature), enabled);
+            assert!(!validated.reader_features.contains(&feature));
         }
+    }
+
+    #[cfg(not(feature = "concurrent-identity-columns-in-dev"))]
+    #[test]
+    fn concurrent_identity_columns_rejected_without_cargo_feature() {
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            crate::schema::concurrent_identity_column::concurrent_identity_column(
+                "id", "seq-abc", 1, 1, false,
+            ),
+        ]));
+        let mut validated = ValidatedTableProperties {
+            properties: HashMap::new(),
+            reader_features: vec![TableFeature::CatalogManaged],
+            writer_features: vec![TableFeature::CatalogManaged],
+        };
+        assert!(matches!(
+            maybe_enable_concurrent_identity_columns(&schema, &mut validated),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(!validated
+            .writer_features
+            .contains(&TableFeature::ConcurrentIdentityColumns));
     }
 
     fn multi_column_schema() -> SchemaRef {
