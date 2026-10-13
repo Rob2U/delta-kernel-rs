@@ -1067,9 +1067,10 @@ mod tests {
     use crate::scan::data_skipping::stats_schema::StripFieldMetadataTransform;
     #[cfg(feature = "concurrent-identity-columns-in-dev")]
     use crate::schema::concurrent_identity_column::concurrent_identity_column;
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
+    use crate::schema::StructType;
     use crate::schema::{
         schema, schema_ref, try_schema, ColumnMetadataKey, DataType, MetadataValue, StructField,
-        StructType,
     };
     use crate::table_features::FeatureType;
     use crate::table_properties::{
@@ -1640,7 +1641,7 @@ mod tests {
     #[cfg(feature = "concurrent-identity-columns-in-dev")]
     fn cic_schema() -> SchemaRef {
         Arc::new(StructType::new_unchecked(vec![
-            concurrent_identity_column("id", "seq-abc", 1, 1),
+            concurrent_identity_column("id", "seq-abc", 1, 1, false),
             StructField::new("name", DataType::STRING, true),
         ]))
     }

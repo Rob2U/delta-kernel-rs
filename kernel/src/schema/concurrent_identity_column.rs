@@ -36,6 +36,7 @@ pub struct ConcurrentIdentityColumn<'a> {
     sequence_id: &'a str,
     start: i64,
     step: i64,
+    allow_explicit_insert: bool,
 }
 
 #[cfg(feature = "concurrent-identity-columns-in-dev")]
@@ -59,25 +60,39 @@ impl<'a> ConcurrentIdentityColumn<'a> {
     pub fn step(&self) -> i64 {
         self.step
     }
+
+    /// Whether user-supplied values may be written to this column instead of sequence-issued
+    /// ones. Explicitly inserted values are not drawn from the sequence and may collide with
+    /// generated values.
+    pub fn allow_explicit_insert(&self) -> bool {
+        self.allow_explicit_insert
+    }
 }
 
 /// Builds a Concurrent Identity Column: a non-nullable `LONG` [`StructField`] carrying the
-/// concurrent `sequenceId` and the classic `start`/`step` keys.
+/// concurrent `sequenceId` and the classic `start`/`step`/`allowExplicitInsert` keys.
 ///
 /// This is a convenience over stamping the [`ColumnMetadataKey`] entries by hand. The `sequence_id`
 /// is an identifier provided by the connector (at most 64 characters); `start` is the first value
-/// the sequence issues and `step` the (non-zero) increment.
+/// the sequence issues, `step` the (non-zero) increment, and `allow_explicit_insert` whether
+/// user-supplied values may be written to the column.
 #[cfg(any(test, feature = "concurrent-identity-columns-in-dev"))]
+#[cfg_attr(
+    not(feature = "concurrent-identity-columns-in-dev"),
+    allow(unreachable_pub)
+)]
 pub fn concurrent_identity_column(
     name: impl Into<String>,
     sequence_id: impl Into<String>,
     start: i64,
     step: i64,
+    allow_explicit_insert: bool,
 ) -> StructField {
     StructField::not_null(name, DataType::LONG).with_metadata(cic_metadata(
         sequence_id,
         start,
         step,
+        allow_explicit_insert,
     ))
 }
 
@@ -85,8 +100,8 @@ pub fn concurrent_identity_column(
 /// borrowed [`ConcurrentIdentityColumn`] view of each.
 ///
 /// A column is a CIC iff it carries the `delta.identity.concurrent.sequenceId` metadata key. When
-/// that key is present, the classic `delta.identity.start` and `delta.identity.step` keys are also
-/// required.
+/// that key is present, the classic `delta.identity.start`, `delta.identity.step` and
+/// `delta.identity.allowExplicitInsert` keys are also required.
 ///
 /// Shared by the write-path report ([`Transaction::concurrent_identity_columns`]) and the
 /// CREATE/ALTER validation ([`validate_concurrent_identity_columns`]).
@@ -116,6 +131,12 @@ pub(crate) fn try_collect_concurrent_identity_columns(
             )?,
             start: parse_required(field, ColumnMetadataKey::IdentityStart, "number", as_number)?,
             step: parse_required(field, ColumnMetadataKey::IdentityStep, "number", as_number)?,
+            allow_explicit_insert: parse_required(
+                field,
+                ColumnMetadataKey::IdentityAllowExplicitInsert,
+                "boolean",
+                as_bool,
+            )?,
         });
     }
     Ok(result)
@@ -176,13 +197,14 @@ pub(crate) fn has_high_water_mark(schema: &StructType) -> bool {
     })
 }
 
-/// The three metadata keys that mark a Concurrent Identity Column: the concurrent sequence id plus
-/// the classic `start`/`step`.
+/// The metadata keys that mark a Concurrent Identity Column: the concurrent sequence id plus the
+/// classic `start`/`step`/`allowExplicitInsert`.
 #[cfg(any(test, feature = "concurrent-identity-columns-in-dev"))]
 pub(crate) fn cic_metadata(
     sequence_id: impl Into<String>,
     start: i64,
     step: i64,
+    allow_explicit_insert: bool,
 ) -> Vec<(String, MetadataValue)> {
     vec![
         (
@@ -198,6 +220,12 @@ pub(crate) fn cic_metadata(
         (
             ColumnMetadataKey::IdentityStep.as_ref().to_string(),
             MetadataValue::Number(step),
+        ),
+        (
+            ColumnMetadataKey::IdentityAllowExplicitInsert
+                .as_ref()
+                .to_string(),
+            MetadataValue::Boolean(allow_explicit_insert),
         ),
     ]
 }
@@ -218,6 +246,12 @@ fn validate_top_level_cic<'a>(
     )?;
     parse_required(field, ColumnMetadataKey::IdentityStart, "number", as_number)?;
     let step = parse_required(field, ColumnMetadataKey::IdentityStep, "number", as_number)?;
+    parse_required(
+        field,
+        ColumnMetadataKey::IdentityAllowExplicitInsert,
+        "boolean",
+        as_bool,
+    )?;
 
     if sequence_id.chars().count() > MAX_SEQUENCE_ID_LENGTH {
         return Err(Error::generic(format!(
@@ -322,6 +356,13 @@ fn as_number(value: &MetadataValue) -> Option<i64> {
     }
 }
 
+fn as_bool(value: &MetadataValue) -> Option<bool> {
+    match value {
+        MetadataValue::Boolean(b) => Some(*b),
+        _ => None,
+    }
+}
+
 fn as_string(value: &MetadataValue) -> Option<&str> {
     match value {
         MetadataValue::String(s) => Some(s),
@@ -337,8 +378,8 @@ mod tests {
     use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
 
     #[test]
-    fn concurrent_identity_column_stamps_all_three_metadata_keys() {
-        let field = concurrent_identity_column("id", "seq-123", 5, 2);
+    fn concurrent_identity_column_stamps_all_identity_metadata_keys() {
+        let field = concurrent_identity_column("id", "seq-123", 5, 2, true);
         assert_eq!(field.name(), "id");
         assert_eq!(field.data_type(), &DataType::LONG);
         assert!(!field.is_nullable());
@@ -353,6 +394,10 @@ mod tests {
         assert_eq!(
             field.get_config_value(&ColumnMetadataKey::IdentityStep),
             Some(&MetadataValue::Number(2))
+        );
+        assert_eq!(
+            field.get_config_value(&ColumnMetadataKey::IdentityAllowExplicitInsert),
+            Some(&MetadataValue::Boolean(true))
         );
     }
 
@@ -373,9 +418,9 @@ mod tests {
     #[test]
     fn collect_borrows_a_view_of_each_identity_column() {
         let schema = StructType::try_new(vec![
-            concurrent_identity_column("id", "seq-1", 1, 1),
+            concurrent_identity_column("id", "seq-1", 1, 1, false),
             StructField::new("payload", DataType::STRING, true),
-            concurrent_identity_column("row_id", "seq-2", 100, 10),
+            concurrent_identity_column("row_id", "seq-2", 100, 10, true),
         ])
         .unwrap();
         let cols = try_collect_concurrent_identity_columns(&schema).unwrap();
@@ -384,10 +429,12 @@ mod tests {
         assert_eq!(cols[0].sequence_id(), "seq-1");
         assert_eq!(cols[0].start(), 1);
         assert_eq!(cols[0].step(), 1);
+        assert!(!cols[0].allow_explicit_insert());
         assert_eq!(cols[1].column_name(), "row_id");
         assert_eq!(cols[1].sequence_id(), "seq-2");
         assert_eq!(cols[1].start(), 100);
         assert_eq!(cols[1].step(), 10);
+        assert!(cols[1].allow_explicit_insert());
     }
 
     #[cfg(feature = "concurrent-identity-columns-in-dev")]
@@ -405,6 +452,14 @@ mod tests {
             (ColumnMetadataKey::IdentityStart, MetadataValue::Number(1)),
         ],
         "delta.identity.step",
+    )]
+    #[case::missing_allow_explicit_insert(
+        &[
+            (ColumnMetadataKey::IdentityConcurrentSequenceId, MetadataValue::String("seq-1".to_string())),
+            (ColumnMetadataKey::IdentityStart, MetadataValue::Number(1)),
+            (ColumnMetadataKey::IdentityStep, MetadataValue::Number(1)),
+        ],
+        "delta.identity.allowExplicitInsert",
     )]
     fn collect_missing_required_key_returns_error(
         #[case] metadata: &[(ColumnMetadataKey, MetadataValue)],
@@ -441,6 +496,15 @@ mod tests {
         ],
         "expected string",
     )]
+    #[case::allow_explicit_insert_not_a_boolean(
+        vec![
+            (ColumnMetadataKey::IdentityConcurrentSequenceId, MetadataValue::String("seq".to_string())),
+            (ColumnMetadataKey::IdentityStart, MetadataValue::Number(1)),
+            (ColumnMetadataKey::IdentityStep, MetadataValue::Number(1)),
+            (ColumnMetadataKey::IdentityAllowExplicitInsert, MetadataValue::String("true".to_string())),
+        ],
+        "expected boolean",
+    )]
     fn collect_wrong_metadata_type_returns_error(
         #[case] metadata: Vec<(ColumnMetadataKey, MetadataValue)>,
         #[case] needle: &str,
@@ -459,7 +523,8 @@ mod tests {
     }
 
     fn cic_field(name: &str, data_type: DataType, nullable: bool, step: i64) -> StructField {
-        StructField::new(name, data_type, nullable).with_metadata(cic_metadata("seq", 1, step))
+        StructField::new(name, data_type, nullable)
+            .with_metadata(cic_metadata("seq", 1, step, false))
     }
 
     #[rstest::rstest]
@@ -468,6 +533,15 @@ mod tests {
     #[case::non_long(vec![cic_field("id", DataType::INTEGER, false, 1)], &[], Err("must be of type LONG"))]
     #[case::nullable(vec![cic_field("id", DataType::LONG, true, 1)], &[], Err("must be non-nullable"))]
     #[case::step_zero(vec![cic_field("id", DataType::LONG, false, 0)], &[], Err("step 0"))]
+    #[case::missing_allow_explicit_insert(
+        vec![StructField::not_null("id", DataType::LONG).with_metadata(
+            cic_metadata("seq", 1, 1, false)
+                .into_iter()
+                .filter(|(k, _)| k != ColumnMetadataKey::IdentityAllowExplicitInsert.as_ref()),
+        )],
+        &[],
+        Err("delta.identity.allowExplicitInsert"),
+    )]
     #[case::high_water_mark(
         vec![cic_field("id", DataType::LONG, false, 1).add_metadata(vec![(
             ColumnMetadataKey::IdentityHighWaterMark.as_ref().to_string(),
@@ -481,8 +555,8 @@ mod tests {
     // Column-name matching is case-sensitive.
     #[case::partition_column_case_sensitive(vec![cic_field("id", DataType::LONG, false, 1)], &["ID"], Ok(true))]
     // Sequence id length: 64 characters is the limit; 65 is rejected.
-    #[case::sequence_id_max_length(vec![concurrent_identity_column("id", "x".repeat(64), 1, 1)], &[], Ok(true))]
-    #[case::sequence_id_too_long(vec![concurrent_identity_column("id", "x".repeat(65), 1, 1)], &[], Err("longer than 64"))]
+    #[case::sequence_id_max_length(vec![concurrent_identity_column("id", "x".repeat(64), 1, 1, false)], &[], Ok(true))]
+    #[case::sequence_id_too_long(vec![concurrent_identity_column("id", "x".repeat(65), 1, 1, false)], &[], Err("longer than 64"))]
     // Sequence ids must be unique within the schema; distinct ids are fine.
     #[case::duplicate_sequence_id(
         vec![cic_field("a", DataType::LONG, false, 1), cic_field("b", DataType::LONG, false, 1)],
@@ -491,8 +565,8 @@ mod tests {
     )]
     #[case::distinct_sequence_ids(
         vec![
-            concurrent_identity_column("a", "seq-1", 1, 1),
-            concurrent_identity_column("b", "seq-2", 1, 1),
+            concurrent_identity_column("a", "seq-1", 1, 1, false),
+            concurrent_identity_column("b", "seq-2", 1, 1, false),
         ],
         &[],
         Ok(true),

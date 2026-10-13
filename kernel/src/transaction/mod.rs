@@ -2299,6 +2299,32 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "concurrent-identity-columns-in-dev")]
+    #[test]
+    fn write_state_requires_concurrent_identity_columns_ack() {
+        let engine = SyncEngine::new_with_store(Arc::new(InMemory::new()));
+        let schema = Arc::new(
+            StructType::try_new([crate::schema::concurrent_identity_column(
+                "id", "seq-abc", 1, 1, false,
+            )])
+            .unwrap(),
+        );
+        let mut txn = create_table("memory:///", schema, "test-engine")
+            .with_table_properties([
+                ("delta.feature.catalogManaged", "supported"),
+                ("io.unitycatalog.tableId", "cic-test"),
+            ])
+            .build(&engine, Box::new(MockCatalogCommitter))
+            .unwrap();
+
+        assert!(matches!(
+            txn.write_state(),
+            Err(Error::InvalidTransactionState(_))
+        ));
+        txn.ack_concurrent_identity_columns();
+        txn.write_state().unwrap();
+    }
+
     #[test]
     fn test_write_context_schemas_exclude_partition_columns(
     ) -> Result<(), Box<dyn std::error::Error>> {

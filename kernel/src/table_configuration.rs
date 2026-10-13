@@ -1879,9 +1879,10 @@ mod test {
         // The full feature set + only a concurrent column (sequenceId, no high-water mark): writes
         // are supported. `identityColumns` alone would be rejected, but its Custom check passes
         // because `concurrentIdentityColumns` is also present.
-        let schema: StructType =
-            StructType::try_new(vec![concurrent_identity_column("id", "seq-abc", 1, 1)])
-                .expect("valid schema");
+        let schema: StructType = StructType::try_new(vec![concurrent_identity_column(
+            "id", "seq-abc", 1, 1, false,
+        )])
+        .expect("valid schema");
         let config = concurrent_identity_config(schema);
         assert!(config.ensure_operation_supported(Operation::Write).is_ok());
     }
@@ -1891,8 +1892,10 @@ mod test {
     fn concurrent_identity_columns_write_requires_catalog_managed() {
         // Dropping `catalogManaged` (and its inCommitTimestamp) leaves an incomplete CIC protocol;
         // the write is rejected by the feature-requirement check.
-        let schema = StructType::try_new(vec![concurrent_identity_column("id", "seq-abc", 1, 1)])
-            .expect("valid schema");
+        let schema = StructType::try_new(vec![concurrent_identity_column(
+            "id", "seq-abc", 1, 1, false,
+        )])
+        .expect("valid schema");
         let config = MockTableConfigurationBuilder::new()
             .with_schema(schema)
             .with_protocol(
@@ -1917,7 +1920,7 @@ mod test {
         // high-water-mark column is internally inconsistent (RFC: every identity column must be
         // concurrent). Kernel rejects the write rather than silently ignore the classic column.
         let schema = StructType::try_new(vec![
-            concurrent_identity_column("id", "seq-abc", 1, 1),
+            concurrent_identity_column("id", "seq-abc", 1, 1, false),
             high_water_mark_field("legacy_id"),
         ])
         .expect("valid schema");
