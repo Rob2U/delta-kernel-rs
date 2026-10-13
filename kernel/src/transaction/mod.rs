@@ -1138,9 +1138,6 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// write state. See [`ConcurrentIdentityColumn`](crate::schema::ConcurrentIdentityColumn) for
     /// the full connector write-flow.
     ///
-    /// Orphaned metadata (a `sequenceId` without the `concurrentIdentityColumns` writer feature) is
-    /// not surfaced through this method, and does not require the acknowledgement.
-    ///
     /// # Errors
     ///
     /// Propagates malformed CIC metadata errors (a detected column missing a required
@@ -1149,12 +1146,6 @@ impl<S: SupportsDataFiles> Transaction<S> {
     pub fn concurrent_identity_columns(
         &self,
     ) -> DeltaResult<HashMap<String, crate::schema::ConcurrentIdentityColumn<'_>>> {
-        if !self
-            .effective_table_config
-            .is_feature_enabled(&TableFeature::ConcurrentIdentityColumns)
-        {
-            return Ok(HashMap::new());
-        }
         crate::schema::try_collect_concurrent_identity_columns(
             self.effective_table_config.logical_schema_ref(),
         )
