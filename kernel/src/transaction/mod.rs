@@ -878,12 +878,11 @@ impl<S> Transaction<S> {
     /// connector has not acknowledged filling them.
     #[cfg(feature = "concurrent-identity-columns-in-dev")]
     fn ensure_concurrent_identity_columns_acknowledged(&self) -> DeltaResult<()> {
-        let has_concurrent_identity_column =
-            !crate::schema::try_collect_concurrent_identity_columns(
-                self.effective_table_config.logical_schema_ref(),
-            )?
-            .is_empty();
-        if !has_concurrent_identity_column {
+        let schema = self.effective_table_config.logical_schema_ref();
+        if !schema
+            .fields()
+            .any(crate::schema::has_concurrent_sequence_id)
+        {
             return Ok(());
         }
         // A CIC column may only exist on a table that enabled the feature.

@@ -103,8 +103,7 @@ pub fn concurrent_identity_column(
 /// that key is present, the classic `delta.identity.start`, `delta.identity.step` and
 /// `delta.identity.allowExplicitInsert` keys are also required.
 ///
-/// Shared by the write-path report ([`Transaction::concurrent_identity_columns`]) and the
-/// CREATE/ALTER validation ([`validate_concurrent_identity_columns`]).
+/// Backs the write-path report ([`Transaction::concurrent_identity_columns`]).
 ///
 /// # Errors
 ///

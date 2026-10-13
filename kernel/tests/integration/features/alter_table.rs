@@ -346,7 +346,7 @@ async fn add_complex_type_column(
 #[case::concurrent_identity_column(
     &[],
     nullable_concurrent_identity_column("new_id", "seq-1"),
-    "must be non-nullable"
+    "cannot add Concurrent Identity Column"
 )]
 #[tokio::test]
 async fn add_column_failures(
@@ -726,11 +726,12 @@ async fn set_nullable_on_layout_column_with_checkpoint(
 
 #[cfg(feature = "concurrent-identity-columns-in-dev")]
 #[rstest]
-#[case::set_nullable_on_concurrent_identity_column(true)]
-#[case::add_concurrent_identity_column(false)]
+#[case::set_nullable_on_concurrent_identity_column(true, "must be non-nullable")]
+#[case::add_concurrent_identity_column(false, "cannot add Concurrent Identity Column")]
 #[tokio::test]
 async fn alter_on_concurrent_identity_column_table_fails(
     #[case] set_nullable: bool,
+    #[case] error_contains: &str,
 ) -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let engine = engine.as_ref();
@@ -759,10 +760,7 @@ async fn alter_on_concurrent_identity_column_table_fails(
         .build(engine, Box::new(TestCatalogCommitter))
         .unwrap_err()
         .to_string();
-    assert!(
-        err.contains("must be non-nullable"),
-        "unexpected error: {err}"
-    );
+    assert!(err.contains(error_contains), "unexpected error: {err}");
     Ok(())
 }
 

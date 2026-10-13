@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
-use crate::schema::StructField;
+use crate::schema::{ColumnMetadataKey, MetadataValue, StructField};
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
@@ -195,6 +195,15 @@ impl AlterTableTransactionBuilder<Modifying> {
         // `None` mode, where no strip fires.
         let current_has_cm = column_mapping_mode == ColumnMappingMode::None
             && schema_has_column_mapping_metadata(&schema);
+        // Keyed by sequence id rather than name, so the binding survives column renames.
+        let existing_sequence_ids: Vec<MetadataValue> = schema
+            .fields()
+            .filter_map(|field| {
+                field
+                    .get_config_value(&ColumnMetadataKey::IdentityConcurrentSequenceId)
+                    .cloned()
+            })
+            .collect();
         let SchemaEvolutionResult {
             schema: evolved_schema,
             new_max_column_id,
@@ -215,17 +224,22 @@ impl AlterTableTransactionBuilder<Modifying> {
             evolved_schema
         };
 
-        // Reject introducing a CIC on a table that does not already have the feature.
-        let has_cic = crate::schema::validate_concurrent_identity_columns(
+        // A CIC is bound to its catalog sequence at CREATE time, so ALTER must not introduce one.
+        if let Some(field) = evolved_schema.fields().find(|field| {
+            field
+                .get_config_value(&ColumnMetadataKey::IdentityConcurrentSequenceId)
+                .is_some_and(|id| !existing_sequence_ids.contains(id))
+        }) {
+            return Err(Error::unsupported(format!(
+                "ALTER TABLE cannot add Concurrent Identity Column '{}'",
+                field.name()
+            )));
+        }
+        // Existing CIC columns must stay valid (e.g. `set_nullable` must not make one nullable).
+        crate::schema::validate_concurrent_identity_columns(
             &evolved_schema,
             table_config.metadata().partition_columns(),
         )?;
-        if has_cic && !table_config.is_feature_enabled(&TableFeature::ConcurrentIdentityColumns) {
-            return Err(Error::unsupported(
-                "ALTER TABLE cannot add a Concurrent Identity Column: enabling the \
-                 concurrentIdentityColumns feature via ALTER is not yet supported",
-            ));
-        }
 
         let evolved_metadata = table_config
             .metadata()
