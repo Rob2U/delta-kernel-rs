@@ -8,6 +8,8 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::expressions::{column_name, ColumnName, Scalar};
+#[cfg(feature = "concurrent-identity-columns-in-dev")]
+use delta_kernel::schema::{concurrent_identity_column, StructType};
 use delta_kernel::schema::{
     schema, schema_ref, try_schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue,
     SchemaRef, StructField,
@@ -18,6 +20,8 @@ use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::DeltaResult;
 use rstest::rstest;
+#[cfg(feature = "concurrent-identity-columns-in-dev")]
+use test_utils::TestCatalogCommitter;
 use test_utils::{
     add_commit, column_mapping_fixtures as fixtures, create_table as create_test_table,
     create_table_and_load_snapshot, engine_store_setup, test_table_setup, test_table_setup_mt,
@@ -33,6 +37,30 @@ fn simple_schema() -> SchemaRef {
 
 fn committer() -> Box<FileSystemCommitter> {
     Box::new(FileSystemCommitter::new())
+}
+
+/// A nullable `LONG` column carrying full Concurrent Identity Column metadata. Built by hand
+/// because `concurrent_identity_column` only builds the valid, non-nullable form and is unavailable
+/// without the `concurrent-identity-columns-in-dev` feature.
+fn nullable_concurrent_identity_column(name: &str, sequence_id: &str) -> StructField {
+    StructField::nullable(name, DataType::LONG).with_metadata([
+        (
+            ColumnMetadataKey::IdentityConcurrentSequenceId.as_ref(),
+            MetadataValue::from(sequence_id),
+        ),
+        (
+            ColumnMetadataKey::IdentityStart.as_ref(),
+            MetadataValue::Number(1),
+        ),
+        (
+            ColumnMetadataKey::IdentityStep.as_ref(),
+            MetadataValue::Number(1),
+        ),
+        (
+            ColumnMetadataKey::IdentityAllowExplicitInsert.as_ref(),
+            MetadataValue::Boolean(false),
+        ),
+    ])
 }
 
 /// Reads `delta.columnMapping.maxColumnId` from the snapshot's metadata. Returns
@@ -316,6 +344,12 @@ async fn add_complex_type_column(
     "timestampNtz"
 )]
 #[case::non_nullable(&[], StructField::not_null("age", DataType::INTEGER), "non-nullable")]
+#[case::concurrent_identity_column(
+    &[],
+    // A CIC must be non-nullable, but the new sequence id is rejected first.
+    nullable_concurrent_identity_column("new_id", "seq-1"),
+    "cannot add Concurrent Identity Column"
+)]
 #[tokio::test]
 async fn add_column_failures(
     #[case] properties: &[(&str, &str)],
@@ -689,6 +723,102 @@ async fn set_nullable_on_layout_column_with_checkpoint(
         .downcast_ref::<StringArray>()
         .expect("layout column is string");
     assert_eq!(col.value(0), col_value);
+    Ok(())
+}
+
+/// Creates a catalog-managed table whose `id` column is a Concurrent Identity Column and returns
+/// its snapshot.
+#[cfg(feature = "concurrent-identity-columns-in-dev")]
+fn create_concurrent_identity_column_table(
+    table_path: &str,
+    engine: &dyn delta_kernel::Engine,
+    properties: &[(&str, &str)],
+) -> DeltaResult<Arc<Snapshot>> {
+    let schema = Arc::new(StructType::try_new([
+        concurrent_identity_column("id", "seq-abc", 1, 1, false),
+        StructField::nullable("v", DataType::STRING),
+    ])?);
+    create_table(table_path, schema, "Test/1.0")
+        .with_table_properties(
+            [
+                ("delta.feature.catalogManaged", "supported"),
+                ("io.unitycatalog.tableId", "cic-test"),
+            ]
+            .into_iter()
+            .chain(properties.iter().copied()),
+        )
+        .build(engine, Box::new(TestCatalogCommitter))?
+        .commit(engine)?
+        .unwrap_committed();
+    Snapshot::builder_for(table_path)
+        .with_max_catalog_version(0)
+        .build(engine)
+}
+
+/// A nullable classic identity column: identity keys but no `sequenceId`.
+#[cfg(feature = "concurrent-identity-columns-in-dev")]
+fn nullable_classic_identity_column(name: &str) -> StructField {
+    StructField::nullable(name, DataType::LONG).with_metadata([
+        (
+            ColumnMetadataKey::IdentityStart.as_ref(),
+            MetadataValue::Number(1),
+        ),
+        (
+            ColumnMetadataKey::IdentityStep.as_ref(),
+            MetadataValue::Number(1),
+        ),
+        (
+            ColumnMetadataKey::IdentityAllowExplicitInsert.as_ref(),
+            MetadataValue::Boolean(false),
+        ),
+    ])
+}
+
+#[cfg(feature = "concurrent-identity-columns-in-dev")]
+enum ConcurrentIdentityColumnAlter {
+    SetNullable,
+    AddConcurrent,
+    AddClassic,
+}
+
+#[cfg(feature = "concurrent-identity-columns-in-dev")]
+#[rstest]
+#[case::set_nullable_on_concurrent_identity_column(
+    ConcurrentIdentityColumnAlter::SetNullable,
+    "must be non-nullable"
+)]
+#[case::add_concurrent_identity_column(
+    ConcurrentIdentityColumnAlter::AddConcurrent,
+    "cannot add Concurrent Identity Column"
+)]
+#[case::add_classic_identity_column(
+    ConcurrentIdentityColumnAlter::AddClassic,
+    "must be concurrent"
+)]
+#[tokio::test]
+async fn alter_on_concurrent_identity_column_table_fails(
+    #[case] op: ConcurrentIdentityColumnAlter,
+    #[case] error_contains: &str,
+) -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+    let engine = engine.as_ref();
+    let snapshot = create_concurrent_identity_column_table(&table_path, engine, &[])?;
+
+    let alter = snapshot.alter_table();
+    let alter = match op {
+        ConcurrentIdentityColumnAlter::SetNullable => alter.set_nullable(column_name!("id")),
+        ConcurrentIdentityColumnAlter::AddConcurrent => {
+            alter.add_column(nullable_concurrent_identity_column("new_id", "seq-new"))
+        }
+        ConcurrentIdentityColumnAlter::AddClassic => {
+            alter.add_column(nullable_classic_identity_column("legacy_id"))
+        }
+    };
+    let err = alter
+        .build(engine, Box::new(TestCatalogCommitter))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains(error_contains), "unexpected error: {err}");
     Ok(())
 }
 

@@ -215,6 +215,11 @@ impl AlterTableTransactionBuilder<Modifying> {
             evolved_schema
         };
 
+        crate::schema::validate_concurrent_identity_column_evolution(
+            table_config.logical_schema_ref(),
+            &evolved_schema,
+        )?;
+
         let evolved_metadata = table_config
             .metadata()
             .clone()
@@ -230,6 +235,8 @@ impl AlterTableTransactionBuilder<Modifying> {
             evolved_metadata,
             evolved_schema,
         )?;
+        // The evolved columns must still satisfy the CIC rules.
+        evolved_table_config.validate_concurrent_identity_columns()?;
 
         AlterTableTransaction::try_new_alter_table(
             self.snapshot,
