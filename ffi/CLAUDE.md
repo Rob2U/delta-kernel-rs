@@ -41,6 +41,8 @@ the caller's memory space.
 - `src/lib.rs` -- main FFI entry points and type definitions
 - `src/handle.rs` -- opaque handle system for passing Rust objects across FFI
 - `src/column_default.rs` -- column-default (`allowColumnDefaults`) reads and the write-path ack
+- `src/concurrent_identity_column.rs` -- Concurrent Identity Column (`concurrentIdentityColumns`)
+  report + write-path ack
 - `src/scan.rs` -- scan FFI interface
 - `src/schema_visitor.rs` -- visitor pattern for schema traversal
 - `src/ffi_tracing.rs` -- log/tracing and metrics callback registration (`#[cfg(feature = "tracing")]`)
@@ -162,6 +164,16 @@ transaction()
   -> transaction_visit_top_level_column_defaults(txn, engine, ctx, visitor)
   -> transaction_ack_column_defaults(txn)   // REQUIRED, else the write context errors with
                                             // KernelError::InvalidTransactionStateError
+  -> get_unpartitioned_write_context(txn, engine) ... add_files ... commit
+```
+
+Concurrent Identity Column create path. `visit_field_cic(state, name, sequence_id, start, step, alloc)` stamps a non-nullable `LONG` field with the CIC metadata and returns a field id. CIC requires a catalog-managed table, so set `catalogManaged` before. To acknowledge CIC support use:
+
+```
+transaction()   // or transaction_with_committer for the catalog-managed table
+  -> transaction_visit_concurrent_identity_columns(txn, engine, ctx, visitor)
+  -> transaction_ack_concurrent_identity_columns(txn)   // REQUIRED for a CIC table, else the write
+                                            // context errors with InvalidTransactionStateError
   -> get_unpartitioned_write_context(txn, engine) ... add_files ... commit
 ```
 
