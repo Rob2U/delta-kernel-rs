@@ -240,6 +240,22 @@ pub(crate) fn has_concurrent_sequence_id(field: &StructField) -> bool {
     concurrent_sequence_id(field).is_some()
 }
 
+/// Returns whether any field of `schema`, at any depth, carries the
+/// `delta.identity.concurrent.sequenceId` metadata key.
+pub(crate) fn schema_has_concurrent_sequence_id(schema: &StructType) -> bool {
+    fn data_type_has(data_type: &DataType) -> bool {
+        match data_type {
+            DataType::Struct(s) => schema_has_concurrent_sequence_id(s),
+            DataType::Array(a) => data_type_has(&a.element_type),
+            DataType::Map(m) => data_type_has(&m.key_type) || data_type_has(&m.value_type),
+            _ => false,
+        }
+    }
+    schema
+        .fields()
+        .any(|field| has_concurrent_sequence_id(field) || data_type_has(field.data_type()))
+}
+
 fn concurrent_sequence_id(field: &StructField) -> Option<&MetadataValue> {
     field.get_config_value(&ColumnMetadataKey::IdentityConcurrentSequenceId)
 }
@@ -696,13 +712,14 @@ mod tests {
         StructField::nullable("v", MapType::new(DataType::STRING, cic_struct(), true)),
         true
     )]
-    fn sequence_id_rejected_at_any_depth_without_feature(
+    fn sequence_id_detected_and_rejected_at_any_depth_without_feature(
         #[case] field: StructField,
-        #[case] rejected: bool,
+        #[case] has_sequence_id: bool,
     ) {
         let schema = StructType::try_new(vec![field]).unwrap();
+        assert_eq!(schema_has_concurrent_sequence_id(&schema), has_sequence_id);
         let result = validate_concurrent_identity_columns(&schema, &[], false);
-        assert_eq!(result.is_err(), rejected, "{result:?}");
+        assert_eq!(result.is_err(), has_sequence_id, "{result:?}");
     }
 
     fn cic_struct() -> DataType {

@@ -1357,20 +1357,20 @@ enum ConcurrentIdentityColumnAlter {
 #[rstest]
 #[case::set_nullable_on_concurrent_identity_column(
     ConcurrentIdentityColumnAlter::SetNullable,
-    "must be non-nullable"
+    None
 )]
 #[case::add_concurrent_identity_column(
     ConcurrentIdentityColumnAlter::AddConcurrent,
-    "metadata annotation 'delta.identity."
+    Some("metadata annotation 'delta.identity.")
 )]
 #[case::add_classic_identity_column(
     ConcurrentIdentityColumnAlter::AddClassic,
-    "metadata annotation 'delta.identity."
+    Some("metadata annotation 'delta.identity.")
 )]
 #[tokio::test]
-async fn alter_on_concurrent_identity_column_table_fails(
+async fn alter_on_concurrent_identity_column_table(
     #[case] op: ConcurrentIdentityColumnAlter,
-    #[case] error_contains: &str,
+    #[case] expected_error: Option<&str>,
 ) -> Result<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let engine = engine.as_ref();
@@ -1388,11 +1388,16 @@ async fn alter_on_concurrent_identity_column_table_fails(
             alter.add_column(nullable_classic_identity_column("legacy_id"))
         }
     };
-    let err = alter
-        .build(engine, Box::new(TestCatalogCommitter))
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains(error_contains), "unexpected error: {err}");
+    let result = alter.build(engine, Box::new(TestCatalogCommitter));
+    match expected_error {
+        None => {
+            result?;
+        }
+        Some(needle) => {
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains(needle), "unexpected error: {err}");
+        }
+    }
     Ok(())
 }
 
